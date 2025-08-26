@@ -1,0 +1,5 @@
+boto3
+pandas
+requests
+snowflake-connector-python
+python-dotenv

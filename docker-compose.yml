@@ -1,0 +1,179 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:13
+    container_name: postgresd
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - default
+
+  # Airflow Webserver
+  airflow:
+    platform: linux/arm64/v8
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: airflow
+    depends_on:
+      - postgres
+      - airflow-scheduler
+      - airflow-triggerer
+      - minio
+      - minio-mc
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__RBAC: "True"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      PYTHONPATH: /opt/airflow
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl:/opt/airflow/etl
+      - ./airflow/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password ${POSTGRES_PASSWORD:-airflow} --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
+        airflow webserver"
+    networks:
+      - default
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    platform: linux/arm64/v8
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: airflow-scheduler
+    depends_on:
+      - postgres
+      - minio
+      - minio-mc
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONPATH: /opt/airflow
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl:/opt/airflow/etl
+      - ./airflow/logs:/opt/airflow/logs
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow scheduler"
+    networks:
+      - default
+
+  airflow-triggerer:
+    platform: linux/arm64/v8
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: airflow-triggerer
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONPATH: /opt/airflow
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl:/opt/airflow/etl
+      - ./airflow/logs:/opt/airflow/logs
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow triggerer"
+    networks:
+      - default
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    networks:
+      - default
+
+  # One-off bucket creator for MinIO
+  minio-mc:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    env_file:
+      - .env
+    entrypoint: >
+      /bin/sh -c "
+        until (/usr/bin/mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin}); do sleep 1; done;
+        /usr/bin/mc mb -p local/${MINIO_BUCKET_NAME:-manga-data} || true;
+        exit 0;
+      "
+    networks:
+      - default
+
+  superset:
+    image: apache/superset:latest
+    container_name: superset
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      SUPERSET_SECRET_KEY: "gJCFB40L6X0AELIMKS6Hrd1T8mDhcavwBuCcFpEmwNlc09QXAp7Qp3+6"
+      SUPERSET_ADMIN_USERNAME: admin
+      SUPERSET_ADMIN_PASSWORD: 1441
+      SUPERSET_ADMIN_FIRSTNAME: admin
+      SUPERSET_ADMIN_LASTNAME: admin
+      SUPERSET_ADMIN_EMAIL: admin@example.com
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${SUPERSET_DB:-superset}
+      # Snowflake envs are passed through env_file for use when configuring DB connections in Superset UI
+    ports:
+      - "88:8088"
+    volumes:
+      - ./superset:/app/superset_home
+    command: >
+      /bin/sh -c "
+        pip install 'snowflake-sqlalchemy>=1.2.0' &&
+        superset db upgrade &&
+        superset fab create-admin --username admin --firstname admin --lastname admin --email admin@example.com --password 1441 &&
+        superset init &&
+        superset run -h 0.0.0.0 -p 8088 --with-threads --reload --debugger"
+    networks:
+      - default
+
+volumes:
+  pg_data:
+  superset_home:
+  minio_data:
+
+networks:
+  default:
